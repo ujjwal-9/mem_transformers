@@ -40,14 +40,16 @@ class Transformer(nn.Module):
         # All of these will get deep-copied multiple times internally
         mha = MultiHeadedAttention(model_dimension, number_of_heads, dropout_probability, log_attention_weights)
         pwn = PositionwiseFeedForwardNet(model_dimension, dropout_probability)
-        update_attn_src = UpdateAttention(model_dimension=model_dimension, n_heads_mha=4, dropout_probability=dropout_probability)
-        output_attn_src = OutputAttention(model_dimension, n_heads_mha=4, dropout_probability=dropout_probability)
-        encoder_layer = EncoderLayer(model_dimension, mha, pwn, update_attn_src, output_attn_src)
-        encoder_layer_final = EncoderLayer(model_dimension, mha, pwn, update_attn_src, output_attn_src, True)
         
-        cross_attn = OutputAttention(model_dimension, n_heads_mha=4, dropout_probability=dropout_probability)
-        decoder_layer = DecoderLayer(model_dimension, mha, pwn, update_attn_src, output_attn_src, cross_attn)
-        decoder_layer_final = DecoderLayer(model_dimension, mha, pwn, update_attn_src, output_attn_src, cross_attn, True)
+        update_attn = UpdateAttention(model_dimension, dropout_probability, mha, pwn)
+        output_attn = OutputAttention(model_dimension, mha)
+        cross_attn = OutputAttention(model_dimension, mha)
+
+        encoder_layer = EncoderLayer(model_dimension, mha, pwn, update_attn, output_attn)
+        encoder_layer_final = EncoderLayer(model_dimension, mha, pwn, update_attn, output_attn, True)
+        
+        decoder_layer = DecoderLayer(model_dimension, mha, pwn, update_attn, output_attn, cross_attn)
+        decoder_layer_final = DecoderLayer(model_dimension, mha, pwn, update_attn, output_attn, cross_attn, True)
 
         self.encoder = Encoder(encoder_layer, encoder_layer_final, number_of_layers)
         self.decoder = Decoder(decoder_layer, decoder_layer_final, number_of_layers)
@@ -174,14 +176,11 @@ class AddNorm(nn.Module):
 
 class UpdateAttention(nn.Module):
 
-    def __init__(self, model_dimension, n_heads_mha, dropout_probability, log_attention_weights=False):
+    def __init__(self, model_dimension, dropout_probability, multi_headed_attention, pointwise_net):
         super().__init__()
 
-        self.multi_headed_attention = MultiHeadedAttention(model_dimension=model_dimension, number_of_heads=n_heads_mha, 
-                                                           dropout_probability=dropout_probability, 
-                                                           log_attention_weights=log_attention_weights)
-        self.pointwise_net = PositionwiseFeedForwardNet(model_dimension=model_dimension, dropout_probability=dropout_probability, 
-                                                        width_mult=4)
+        self.multi_headed_attention = copy.deepcopy(multi_headed_attention)
+        self.pointwise_net = copy.deepcopy(pointwise_net)
         self.add_norm1 = AddNorm(model_dimension)
         self.add_norm2 = AddNorm(model_dimension)
         self.positional_encoding = PositionalEncoding(model_dimension, dropout_probability)
@@ -201,12 +200,10 @@ class UpdateAttention(nn.Module):
 
 class OutputAttention(nn.Module):
 
-    def __init__(self, model_dimension, n_heads_mha, dropout_probability, log_attention_weights=False):
+    def __init__(self, model_dimension, multi_headed_attention):
         super().__init__()
 
-        self.multi_headed_attention = MultiHeadedAttention(model_dimension=model_dimension, number_of_heads=n_heads_mha, 
-                                                           dropout_probability=dropout_probability, 
-                                                           log_attention_weights=log_attention_weights)
+        self.multi_headed_attention = copy.deepcopy(multi_headed_attention)
         self.add_norm = AddNorm(model_dimension)
         self.model_dimension = model_dimension
 
