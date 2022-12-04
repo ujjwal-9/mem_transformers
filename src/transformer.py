@@ -24,10 +24,10 @@ class Transformer(nn.Module):
 
     def __init__(self, model_dimension, src_vocab_size, trg_vocab_size, number_of_heads, number_of_layers, dropout_probability, log_attention_weights=True, mem_size=16):
         super().__init__()
-        self.model_dimension = model_dimension
+        
         self.mem_size = mem_size
-        self.initialize_memory(self.mem_size, self.model_dimension)
-
+        self.model_dimension = model_dimension
+        
         # Embeds source/target token ids into embedding vectors
         self.src_embedding = Embedding(src_vocab_size, model_dimension)
         self.trg_embedding = Embedding(trg_vocab_size, model_dimension)
@@ -38,12 +38,12 @@ class Transformer(nn.Module):
         self.trg_pos_embedding = PositionalEncoding(model_dimension, dropout_probability)
 
         # All of these will get deep-copied multiple times internally
-        mha = MultiHeadedAttention(model_dimension, number_of_heads, dropout_probability, log_attention_weights)
+        mha = nn.MultiheadAttention(model_dimension, number_of_heads, dropout_probability, batch_first=True)
         pwn = PositionwiseFeedForwardNet(model_dimension, dropout_probability)
         
         update_attn = UpdateAttention(model_dimension, dropout_probability, mha, pwn)
         output_attn = OutputAttention(model_dimension, mha)
-        cross_attn = OutputAttention(model_dimension, mha)
+        cross_attn = CrossAttention(model_dimension, mha)
 
         encoder_layer = EncoderLayer(model_dimension, mha, pwn, update_attn, output_attn)
         encoder_layer_final = EncoderLayer(model_dimension, mha, pwn, update_attn, output_attn, True)
@@ -51,16 +51,19 @@ class Transformer(nn.Module):
         decoder_layer = DecoderLayer(model_dimension, mha, pwn, update_attn, output_attn, cross_attn)
         decoder_layer_final = DecoderLayer(model_dimension, mha, pwn, update_attn, output_attn, cross_attn, True)
 
-        self.encoder = Encoder(encoder_layer, encoder_layer_final, number_of_layers)
-        self.decoder = Decoder(decoder_layer, decoder_layer_final, number_of_layers)
+        self.encoder = Encoder(encoder_layer, encoder_layer_final, number_of_layers-1, mem_size, model_dimension)
+        self.decoder = Decoder(decoder_layer, decoder_layer_final, number_of_layers-1, mem_size, model_dimension)
 
         # Converts final target token representations into log probabilities vectors of the target vocab size
         self.decoder_generator = DecoderGenerator(model_dimension, trg_vocab_size)        
         self.init_params()
+        self.initialize_memory()
 
-    def initialize_memory(self, mem_size, model_dimension):
-        self.src_memory = nn.init.xavier_uniform_(nn.Parameter(torch.empty(1, mem_size, model_dimension)))
-        self.trg_memory = nn.init.xavier_uniform_(nn.Parameter(torch.empty(1,mem_size, model_dimension)))
+    def initialize_memory(self):
+        # self.src_memory = nn.init.xavier_uniform_(nn.Parameter(torch.empty(1, self.mem_size, self.model_dimension)))
+        # self.trg_memory = nn.init.xavier_uniform_(nn.Parameter(torch.empty(1,self.mem_size, self.model_dimension)))
+        self.src_memory = self.encoder.src_memory
+        self.trg_memory = self.decoder.trg_memory
     
     def init_params(self, default_initialization=False):
         # Not mentioned in the paper, but other implementations used xavier.
@@ -71,36 +74,32 @@ class Transformer(nn.Module):
                 if p.dim() > 1:
                     nn.init.xavier_uniform_(p)
 
-    def forward(self, src_token_ids_batch, trg_token_ids_batch, src_mask, trg_mask, infer=False):
-        hidden_state = self.encode(self.src_memory, src_token_ids_batch, src_mask)
-        if infer:
-            return hidden_state
-        trg_log_probs = self.decode(hidden_state, self.trg_memory, trg_token_ids_batch, trg_mask)
-        return hidden_state, trg_log_probs
+    def forward(self, src_token_ids_batch, trg_token_ids_batch, src_mask, trg_mask):
+        self.src_hidden_state = self.encode(src_token_ids_batch, src_mask)
+        self.trg_log_probs  = self.decode(self.src_hidden_state, trg_token_ids_batch, trg_mask)
+        return self.src_hidden_state, self.trg_log_probs
 
     # Modularized into encode/decode functions for optimizing the decoding/translation process (see translation script)
-    def encode(self, src_memory, src_token_ids_batch, src_mask):
+    def encode(self, src_token_ids_batch, src_mask):
         src_embeddings_batch = self.src_embedding(src_token_ids_batch)  # get embedding vectors for src token ids
         src_embeddings_batch = self.src_pos_embedding(src_embeddings_batch)  # add positional embedding
-        hidden_state = self.encoder(src_memory, src_embeddings_batch, src_mask)  # forward pass through the encoder
+        hidden_state, self.src_memory = self.encoder(src_embeddings_batch, src_mask)  # forward pass through the encoder
         return hidden_state
 
-    def decode(self, hidden_state, trg_memory, trg_token_ids_batch, trg_mask):
+    def decode(self, src_hidden_state,  trg_token_ids_batch, trg_mask):
         trg_embeddings_batch = self.trg_embedding(trg_token_ids_batch)  # get embedding vectors for trg token ids
         trg_embeddings_batch = self.trg_pos_embedding(trg_embeddings_batch)  # add positional embedding
         # Shape (B, T, D), where B - batch size, T - longest target token-sequence length and D - model dimension
-        trg_representations_batch= self.decoder(hidden_state, trg_memory, trg_embeddings_batch, trg_mask)
-        # with torch.no_grad():
-        #     self.trg_memory = nn.Parameter(trg_memory_update)
+        self.trg_hidden_state, self.trg_memory = self.decoder(src_hidden_state, trg_embeddings_batch, trg_mask)
 
         # After this line we'll have a shape (B, T, V), where V - target vocab size, decoder generator does a simple
         # linear projection followed by log softmax
-        trg_log_probs = self.decoder_generator(trg_representations_batch)
+        trg_log_probs = self.decoder_generator(self.trg_hidden_state)
 
         # Reshape into (B*T, V) as that's a suitable format for passing it into KL div loss
-        trg_log_probs = trg_log_probs.reshape(-1, trg_log_probs.shape[-1])
+        self.trg_log_probs = trg_log_probs.reshape(-1, trg_log_probs.shape[-1])
 
-        return trg_log_probs  # the reason I use log here is that PyTorch's nn.KLDivLoss expects log probabilities
+        return self.trg_log_probs  # the reason I use log here is that PyTorch's nn.KLDivLoss expects log probabilities
 
 #
 # Encoder architecture
@@ -109,26 +108,29 @@ class Transformer(nn.Module):
 
 class Encoder(nn.Module):
 
-    def __init__(self, encoder_layer, encoder_layer_final, number_of_layers):
+    def __init__(self, encoder_layer, encoder_layer_final, number_of_layers, mem_size, model_dimension):
         super().__init__()
         assert isinstance(encoder_layer, EncoderLayer), f'Expected EncoderLayer got {type(encoder_layer)}.'
 
         self.encoder_layers = get_clones(encoder_layer, number_of_layers)
         self.encoder_layers.append(encoder_layer_final)
+        self.src_memory = nn.init.xavier_uniform_(nn.Parameter(torch.empty(1, mem_size, model_dimension)))
 
-    def forward(self, src_memory, src_embeddings_batch, src_mask):
+    def forward(self, src_embeddings_batch, src_mask):
         # Just update the naming so as to reflect the semantics of what this var will become (the initial encoder layer
         # has embedding vectors as input but later layers have richer token representations)
         src_representations_batch = src_embeddings_batch
 
         # Forward pass through the encoder stack
-        for encoder_layer in self.encoder_layers:
+        for i, encoder_layer in enumerate(self.encoder_layers):
             # src_mask's role is to mask/ignore padded token representations in the multi-headed self-attention module
-            hidden_state = encoder_layer(src_memory, src_representations_batch, src_mask)
-
+            if i!=0:
+                src_mask = None
+            hidden_state, self.src_memory = encoder_layer(self.src_memory, src_representations_batch, src_mask)
+        
         # Not mentioned explicitly in the paper (a consequence of using LayerNorm before instead of after the sublayer
         # check out the SublayerLogic module)
-        return hidden_state
+        return hidden_state, self.src_memory
 
 
 class EncoderLayer(nn.Module):
@@ -151,15 +153,16 @@ class EncoderLayer(nn.Module):
     def forward(self, src_memory, src_representations_batch, src_mask):
         # Define anonymous (lambda) function which only takes src_representations_batch (srb) as input,
         # this way we have a uniform interface for the sublayer logic.
-        encoder_self_attention = self.src_multi_headed_attention(query=src_representations_batch, key=src_representations_batch, value=src_representations_batch, mask=src_mask)
+        encoder_self_attention, self_attn_wts = self.src_multi_headed_attention(query=src_representations_batch, key=src_representations_batch, value=src_representations_batch, key_padding_mask=src_mask, need_weights=False)
         src_representations_batch = self.norm(src_representations_batch, encoder_self_attention)
         if self.apply_memory_update:
             hidden_state = self.output_attention(src_memory, src_representations_batch, None)
             src_memory = self.update_attention(src_memory, src_representations_batch, None)
             src_representations_batch = hidden_state
+            src_memory = nn.Parameter(src_memory)
         
         src_representations_batch = self.norm_final(self.pointwise_net(src_representations_batch))
-        return src_representations_batch
+        return src_representations_batch, src_memory
 
 
 class AddNorm(nn.Module):
@@ -187,15 +190,16 @@ class UpdateAttention(nn.Module):
 
         self.model_dimension = model_dimension
 
-    def forward(self, src_memory, src_representations_batch, src_mask):
+    def forward(self, memory, representations_batch, mask):
         # Define anonymous (lambda) function which only takes src_representations_batch (srb) as input,
         # this way we have a uniform interface for the sublayer logic.
-        src_intr_memory = self.multi_headed_attention(query=src_memory, key=src_representations_batch, value=src_representations_batch, mask=src_mask)
-        src_intr_memory = self.add_norm1(src_intr_memory)
-        new_memory = self.add_norm2(self.pointwise_net(src_intr_memory))
+        memory = memory.repeat(representations_batch.shape[0],1,1)
+        intr_memory, self_attn_wts = self.multi_headed_attention(query=memory, key=representations_batch, value=representations_batch, key_padding_mask=mask, need_weights=False)
+        intr_memory = intr_memory[:1]
+        intr_memory = self.add_norm1(intr_memory)
+        new_memory = self.add_norm2(self.pointwise_net(intr_memory))
         # M_t = M_t + PE(M_t)
         new_memory = new_memory + self.positional_encoding(new_memory)
-
         return new_memory
 
 class OutputAttention(nn.Module):
@@ -207,12 +211,29 @@ class OutputAttention(nn.Module):
         self.add_norm = AddNorm(model_dimension)
         self.model_dimension = model_dimension
 
-    def forward(self, src_memory, src_representations_batch, src_mask):
+    def forward(self, memory, representations_batch, mask=None):
+        memory = memory.repeat(representations_batch.shape[0],1,1)
         # Define anonymous (lambda) function which only takes src_representations_batch (srb) as input,
         # this way we have a uniform interface for the sublayer logic.
-        hidden_state = self.multi_headed_attention(query=src_representations_batch, key=src_memory, value=src_memory, mask=src_mask)
-        hidden_state = self.add_norm(hidden_state, src_representations_batch)
+        hidden_state, self_attn_wts = self.multi_headed_attention(query=representations_batch, key=memory, value=memory, key_padding_mask=mask, need_weights=False)
+        hidden_state = self.add_norm(hidden_state, representations_batch)
+        memory = memory[:1]
+        return hidden_state
 
+class CrossAttention(nn.Module):
+
+    def __init__(self, model_dimension, multi_headed_attention):
+        super().__init__()
+
+        self.multi_headed_attention = copy.deepcopy(multi_headed_attention)
+        self.add_norm = AddNorm(model_dimension)
+        self.model_dimension = model_dimension
+
+    def forward(self, hidden_state, trg_representations_batch, mask=None):
+        # Define anonymous (lambda) function which only takes src_representations_batch (srb) as input,
+        # this way we have a uniform interface for the sublayer logic.
+        decoder_hidden_state, self_attn_wts = self.multi_headed_attention(query=trg_representations_batch, key=hidden_state, value=hidden_state, key_padding_mask=mask, need_weights=False)
+        decoder_hidden_state = self.add_norm(decoder_hidden_state, trg_representations_batch)
         return hidden_state
 
 #
@@ -222,26 +243,27 @@ class OutputAttention(nn.Module):
 
 class Decoder(nn.Module):
 
-    def __init__(self, decoder_layer, decoder_layer_final, number_of_layers):
+    def __init__(self, decoder_layer, decoder_layer_final, number_of_layers, mem_size, model_dimension):
         super().__init__()
         assert isinstance(decoder_layer, DecoderLayer), f'Expected DecoderLayer got {type(decoder_layer)}.'
-
-        self.decoder_layers = get_clones(decoder_layer, number_of_layers-1)
+        self.decoder_layers = get_clones(decoder_layer, number_of_layers)
         self.decoder_layers.append(decoder_layer_final)
-        self.norm = nn.LayerNorm(decoder_layer.model_dimension)
+        self.trg_memory = nn.init.xavier_uniform_(nn.Parameter(torch.empty(1, mem_size, model_dimension)))
 
-    def forward(self, hidden_state, trg_memory, trg_embeddings_batch, trg_mask):
+    def forward(self, hidden_state, trg_embeddings_batch, trg_mask):
         # Just update the naming so as to reflect the semantics of what this var will become
         trg_representations_batch = trg_embeddings_batch
 
         # Forward pass through the decoder stack
-        for decoder_layer in self.decoder_layers:
+        for i, decoder_layer in enumerate(self.decoder_layers):
+            if i!=0:
+                trg_mask = None
             # Target mask masks pad tokens as well as future tokens (current target token can't look forward)
-            trg_representations_batch= decoder_layer(hidden_state, trg_memory, trg_representations_batch, trg_mask)
-
+            trg_representations_batch, self.trg_memory = decoder_layer(hidden_state, self.trg_memory, trg_representations_batch, trg_mask)
+        
         # Not mentioned explicitly in the paper (a consequence of using LayerNorm before instead of after the sublayer
         # check out the SublayerLogic module)
-        return self.norm(trg_representations_batch)
+        return trg_representations_batch, self.trg_memory
 
 
 class DecoderLayer(nn.Module):
@@ -272,19 +294,19 @@ class DecoderLayer(nn.Module):
         # Define anonymous (lambda) function which only takes trg_representations_batch (trb - funny name I know)
         # as input - this way we have a uniform interface for the sublayer logic.
         # The inputs which are not passed into lambdas are "cached" here that's why the thing works.
-        decoder_self_attention = self.trg_multi_headed_attention(query=trg_representations_batch, key=trg_representations_batch, value=trg_representations_batch, mask=trg_mask)
+        decoder_self_attention, self_attn_wts = self.trg_multi_headed_attention(query=trg_representations_batch, key=trg_representations_batch, value=trg_representations_batch, key_padding_mask=trg_mask, need_weights=False)
         trg_representations_batch = self.norm(trg_representations_batch, decoder_self_attention)
-        decoder_hidden_state = trg_representations_batch
         if self.apply_memory_update:
             decoder_hidden_state = self.output_attention(trg_memory, trg_representations_batch, None)
             trg_memory = self.update_attention(trg_memory, trg_representations_batch, None)
             trg_representations_batch = self.norm_attn(decoder_hidden_state, trg_representations_batch)
+            trg_memory = nn.Parameter(trg_memory)
         
-        trg_representations_batch = self.cross_attention(hidden_state, decoder_hidden_state, None)
+        trg_representations_batch = self.cross_attention(hidden_state, trg_representations_batch, None)
         trg_representations_batch = self.norm2(trg_representations_batch)
         trg_representations_batch = self.norm_final(trg_representations_batch, self.pointwise_net(trg_representations_batch))
         
-        return trg_representations_batch
+        return trg_representations_batch, trg_memory
 
 
 #

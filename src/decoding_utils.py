@@ -1,13 +1,29 @@
 import torch
 
-def beam_decoding(baseline_transformer, src_representations_batch, src_mask, trg_field_processor, max_target_tokens=100):
+def get_masks_and_count_tokens_trg(trg_token_ids_batch, pad_token_id):
+    batch_size = trg_token_ids_batch.shape[0]
+    device = trg_token_ids_batch.device
+
+    # Same as src_mask but we additionally want to mask tokens from looking forward into the future tokens
+    # Note: wherever the mask value is true we want to attend to that token, otherwise we mask (ignore) it.
+    sequence_length = trg_token_ids_batch.shape[1]  # trg_token_ids shape = (B, T) where T max trg token-sequence length
+    trg_padding_mask = (trg_token_ids_batch != pad_token_id).view(batch_size, 1, 1, -1)  # shape = (B, 1, 1, T)
+    trg_no_look_forward_mask = torch.triu(torch.ones((1, 1, sequence_length, sequence_length), device=device) == 1).transpose(2, 3)
+
+    # logic AND operation (both padding mask and no-look-forward must be true to attend to a certain target token)
+    trg_mask = trg_padding_mask & trg_no_look_forward_mask  # final shape = (B, 1, T, T)
+    num_trg_tokens = torch.sum(trg_padding_mask.long())
+
+    return trg_mask, num_trg_tokens
+
+def beam_decoding(beam_size, tokenizer, baseline_transformer, src_representations_batch, src_mask, trg_field_processor, max_target_tokens=100):
     device = next(baseline_transformer.parameters())
-    pad_token_id = trg_field_processor.vocab.stoi[PAD_TOKEN]
+    pad_token_id = tokenizer.pad_token_id
 
     # Initial prompt is the beginning/start of the sentence token. Make it compatible shape with source batch => (B,1)
     batch_size, S, model_dimension = src_representations_batch.shape
-    target_multiple_hypotheses_tokens = [[BOS_TOKEN] for _ in range(batch_size)]
-    trg_token_ids_batch = torch.tensor([[trg_field_processor.vocab.stoi[tokens[0]]] for tokens in target_multiple_hypotheses_tokens], device=device)
+    target_multiple_hypotheses_tokens = [[] for _ in range(batch_size)]
+    trg_token_ids_batch = torch.tensor([[] for tokens in target_multiple_hypotheses_tokens], device=device)
 
     # Repeat so that source sentence representations are repeated contiguously, say we have [s1, s2] we want
     # [s1, s1, s2, s2] and not [s1, s2, s1, s2] where s1 is single sentence representation with shape=(S, D)
